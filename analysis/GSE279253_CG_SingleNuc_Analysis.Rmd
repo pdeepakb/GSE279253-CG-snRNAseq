@@ -1,3 +1,4 @@
+
 ---
 title: "Single-Nucleus RNA-seq Analysis: Celiac Ganglion (GSM8565269)"
 author: "Deepak Balakrishnan\"
@@ -8,165 +9,219 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
+## Install packages (if needed)
 
-## Install libraries
-```{r}
-# Ensure remotes package is available
-if (!requireNamespace("remotes", quietly = TRUE)) {
-  install.packages("remotes")
-}
+```{r install}
+# Install packages necessary for analysis
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+remotes::install_github("mojaveazure/seurat-disk", force = TRUE)    # For conversion between Seurat and HDF5 formats
+remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", force = TRUE) # Doublet detection tool
 
-# Install Seurat v4.3.0 and relevant tools
-remotes::install_version("Seurat", version = "4.3.0", upgrade = "never")
-remotes::install_github("mojaveazure/seurat-disk", force = TRUE)
-remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", force = TRUE)
-
-# Optional devtools (only needed if installing via devtools later)
-if (!requireNamespace("devtools", quietly = TRUE)) {
-  install.packages("devtools")
-}
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
 library(devtools)
 
-# Optionally install SCType (commented unless needed)
-# devtools::install_github("IanevskiAleksandr/sc-type", force = TRUE)
-
-# Bioconductor packages (e.g., for gene annotation and HDF5 support)
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages("BiocManager")
-}
-
-BiocManager::install("org.Rn.eg.db", ask = FALSE, update = FALSE)
-BiocManager::install("rhdf5", ask = FALSE, update = FALSE)
-
+# Bioconductor packages for gene annotation and HDF5 reading
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("org.Rn.eg.db", ask = FALSE, update = FALSE) # Rat genome annotations
+BiocManager::install("rhdf5", ask = FALSE, update = FALSE)       # HDF5 interface
 ```
 
-## 📦 Load Required Libraries
-```{r libraries}
-library(Seurat)
-library(SeuratDisk)
-library(ggplot2)
-library(dplyr)
-library(DoubletFinder)
-library(clusterProfiler)
-library(org.Rn.eg.db)
-library(enrichplot)
-#library(scType)
-library(plyr)
-library(rhdf5)
-library(Matrix)
+## Load Required Libraries 
+
+```{r load libraries}
+library(Seurat)           # Core package for single-cell RNA-seq analysis
+library(SeuratDisk)       # For seamless import/export of single-cell data formats
+library(BPCells)          # (optional) for additional cell quality metrics
+library(SeuratObject)     # Base object system used by Seurat
+library(ggplot2)          # Visualization
+library(dplyr)            # Data wrangling and piping
+library(DoubletFinder)    # Doublet detection algorithm for single-cell data
+library(clusterProfiler)  # Functional enrichment analysis (GO, pathways)
+library(org.Rn.eg.db)     # Rat genome annotation database
+library(enrichplot)       # Plot enrichment results
+#library(scType)         # Automated cell type annotation tool (optional)
+library(plyr)             # Data manipulation (for mapvalues function)
+library(rhdf5)            # Read HDF5 files
+library(Matrix)           # Efficient sparse matrix handling
+library(hdf5r)            # Alternative HDF5 interface (object-oriented)
+library(SingleR)          # Automated cell type annotation using reference data
+library(celldex)          # Reference datasets for SingleR (optional, install if needed)
 ```
 
-## 📥 Load 10X Data (H5)
 
-```{r load-h5}
-setwd("~/Data/GSE279253-CG-snRNAseq")
+## Load Data and Apply Author Filtering
+
+```{r load and process data}
+setwd("~/Data/GSE279253-CG-snRNAseq") # Set working directory
 
 file_path <- "~/Data/GSE279253-CG-snRNAseq/data/GSM8565269_CG.h5"
 
-# Read components of the sparse matrix from /matrix group
-data <- h5read(file_path, "/matrix/data")
-indices <- h5read(file_path, "/matrix/indices")
-indptr <- h5read(file_path, "/matrix/indptr")
-barcodes <- h5read(file_path, "/matrix/barcodes")
-features <- h5read(file_path, "/matrix/features/name")
+# Open the HDF5 file using hdf5r
+h5 <- H5File$new(file_path, mode = "r")
+h5$ls(recursive = TRUE)  # List all datasets and groups inside the file
 
-#check for duplicate gene names
-dup_genes <- features[duplicated(features)]
-length(dup_genes)
+# Extract sparse matrix components (10X Cell Ranger format: data, indices, indptr)
+data     <- as.numeric(h5[["matrix/data"]][] )
+indices  <- h5[["matrix/indices"]][]
+indptr   <- h5[["matrix/indptr"]][]
+shape    <- h5[["matrix/shape"]][]  # [n_genes, n_cells]
 
-# Replace underscores with dashes in original features vector
-clean_features <- gsub("_", "-", features)
+n_genes <- shape[1]
+n_cells <- shape[2]
 
-# Make unique feature names
-unique_features <- make.unique(clean_features)
+# Read gene and barcode info
+barcodes <- h5[["matrix/barcodes"]][]
+gene_ids <- h5[["matrix/features/id"]][]
+gene_names <- h5[["matrix/features/name"]][]
 
-# Create sparse matrix (CSC format)
-mat <- sparseMatrix(
-  i = indices + 1,
-  p = indptr,
-  x = data,
-  dims = c(length(features), length(barcodes)),
-  dimnames = list(unique_features, barcodes)
+# Construct sparse matrix (genes x cells)
+mat <- new("dgCMatrix",
+    x = data,
+    i = indices,
+    p = indptr,
+    Dim = shape,
+    Dimnames = list(gene_names, barcodes)
 )
-# Transpose matrix because 10X matrices are usually genes x cells,
-# but barcodes are cells and features are genes; depends on the format.
-# Check your data shape to confirm:
-dim(mat)  # Should be cells x genes
 
-# Create Seurat object
-seurat_obj <- CreateSeuratObject(counts = mat, project = "CG", min.cells = 3, min.features = 200)
+# Ensure unique gene names (important to avoid errors downstream)
+rownames(mat) <- make.unique(rownames(mat))
 
+# Load barcodes filtered by the authors (barcodes_analyzed)
+barcodes_analyzed <- h5[["metadata/barcodes_analyzed"]][]
+barcodes_analyzed <- as.character(barcodes_analyzed)  # Convert to character vector
+
+# Load cell probabilities from droplet_latents (probability that barcode is a real cell)
+cell_probs <- h5[["droplet_latents/cell_probability"]][]
+
+# Visualize cell probability distribution to decide threshold
+hist(cell_probs, breaks = 50, main = "Cell Probability Distribution", xlab = "Cell Probability")
+
+# Set threshold for cell probability (common cutoff, adjust as needed)
+threshold <- 0.5
+
+# Identify barcodes that are both author-filtered AND have cell_prob >= threshold
+is_in_analyzed <- barcodes %in% barcodes_analyzed
+keep_cells <- which(is_in_analyzed & (cell_probs >= threshold))
+
+# Subset the matrix to keep only filtered cells
+mat_filtered <- mat[, keep_cells]
+filtered_barcodes <- colnames(mat)[keep_cells]
+colnames(mat_filtered) <- filtered_barcodes
+
+# Create Seurat object using filtered matrix (counts)
+seurat_obj <- CreateSeuratObject(counts = mat_filtered)
 ```
 
-## 🧼 Quality Control Filtering
 
-```{r qc}
+## Quality Control (QC)
+
+**Goal:** Remove low-quality cells/nuclei likely due to debris, dead cells, or doublets.
+
+```{r QC}
+# Calculate percent mitochondrial genes (genes starting with "mt-")
 seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt-")
+
+# Visualize QC metrics to choose thresholds:
 VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Filter cells:
+# - Keep cells with more than 1000 detected features (genes) to remove empty droplets
+# - Remove cells with high mitochondrial RNA (>10%), indicating stressed/dead cells
 seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 1000 & percent.mt < 10)
 ```
 
-## 🔎 Doublet Detection and Removal
+## Doublet Detection and Removal
 
-```{r doublet}
+**Rationale:** Doublets are droplets with 2+ cells, artificially merging expression profiles, confounding analysis.
+
+```{r doublet removal}
+# Normalize, find variable features, scale data, run PCA (required for DoubletFinder)
 seurat_obj <- NormalizeData(seurat_obj)
 seurat_obj <- FindVariableFeatures(seurat_obj)
 seurat_obj <- ScaleData(seurat_obj)
 seurat_obj <- RunPCA(seurat_obj, npcs = 40)
 
+# Optimize parameters for doublet detection
 sweep.res <- paramSweep_v3(seurat_obj, PCs = 1:20, sct = FALSE)
 sweep.stats <- summarizeSweep(sweep.res)
 bcmvn <- find.pK(sweep.stats)
 
+# Run DoubletFinder with chosen parameters (pN, pK, expected number of doublets)
 seurat_obj <- doubletFinder_v3(seurat_obj, PCs = 1:20, pN = 0.25, pK = 0.15, nExp = 100)
+
+# Subset to keep only predicted singlets (non-doublets)
 seurat_obj <- subset(seurat_obj, subset = DF.classifications_0.25_0.15_100 == "Singlet")
 ```
 
-## 📊 Normalization and Dimensionality Reduction
+## Normalization and Dimensionality Reduction
 
-```{r dimred}
+```{r norm - dimred}
+# Normalize data again (log-normalize)
 seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize")
+
+# Identify highly variable genes (HVGs)
 seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+
+# Scale and center data (mean 0, variance 1)
 seurat_obj <- ScaleData(seurat_obj)
+
+# Run PCA to reduce dimensionality
 seurat_obj <- RunPCA(seurat_obj, npcs = 40)
+
+# Visualize explained variance to select number of PCs
 ElbowPlot(seurat_obj)
+
 ```
 
-## 🔗 Clustering and UMAP
+## Clustering and UMAP
 
 ```{r cluster}
+# Construct nearest-neighbor graph based on selected PCs
 seurat_obj <- FindNeighbors(seurat_obj, dims = 1:40)
+
+# Cluster cells with Louvain algorithm; resolution controls granularity
 seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+
+# Visualize clusters with UMAP embedding
 seurat_obj <- RunUMAP(seurat_obj, dims = 1:40)
-DimPlot(seurat_obj, reduction = "umap", label = TRUE)
+DimPlot(seurat_obj, reduction = "umap", label = TRUE, pt.size = 0.5) + ggtitle("UMAP Clusters")
 ```
 
-## 🧬 Marker Gene Identification
+## Identify Marker Genes for Each Cluster
 
-```{r markers}
+```{r marker}
+# Find marker genes for each cluster (genes enriched in each cluster)
 markers <- FindAllMarkers(seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.1, test.use = "wilcox")
+
+# Save marker genes table for downstream analysis
 write.csv(markers, "../results/GSM8565269_cluster_markers.csv", row.names = FALSE)
 
+# Visualize top 10 markers per cluster in a heatmap
 top10 <- markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
 DoHeatmap(seurat_obj, features = top10$gene) + NoLegend()
+
 ```
 
-## 🎯 Feature Plots for Known Markers
+## Plot Known Marker Genes
 
 ```{r features}
-FeaturePlot(seurat_obj, features = c("Tacr1", "Cckar", "Ramp1", "Mki67", "Cdk1", "Cdc20"), cols = c("lightgrey", "blue"))
+FeaturePlot(seurat_obj, features = c("Tacr1", "Cckar", "Ramp1", "Mki67", "Cdk1", "Cdc20"), cols = c("lightgrey", "blue")) + ggtitle("Known Marker Expression")
+
 ```
 
-## 🔬 GO Enrichment with `clusterProfiler` (Alternative to GOrilla)
+## Functional Enrichment (GO) for a Cluster
 
-```{r enrich-go}
+```{r GO}
+# Select significant markers in cluster 1
 cluster1_genes <- markers %>% filter(cluster == 1 & p_val_adj < 0.05) %>% pull(gene)
 
+# Convert gene symbols to Entrez IDs (needed for clusterProfiler)
 entrez_genes <- bitr(cluster1_genes,
                      fromType = "SYMBOL",
                      toType = "ENTREZID",
                      OrgDb = org.Rn.eg.db)
 
+# Perform GO Biological Process enrichment analysis
 ego <- enrichGO(gene = entrez_genes$ENTREZID,
                 OrgDb = org.Rn.eg.db,
                 keyType = "ENTREZID",
@@ -175,37 +230,49 @@ ego <- enrichGO(gene = entrez_genes$ENTREZID,
                 qvalueCutoff = 0.05,
                 readable = TRUE)
 
-dotplot(ego) + ggtitle("GO BP Enrichment - Cluster 1")
+# Visualize GO enrichment terms
+dotplot(ego) + ggtitle("GO Biological Process Enrichment - Cluster 1")
+
 ```
+##  Neural Cell Type Annotation with SingleR
 
-## 🧠 Cell Type Annotation with `scType`
+```{r annotation}
 
-```{r sctype}
-sc_markers <- scType_markers
-tissue_type <- "Neural"
-
-seurat_obj@meta.data$custom_cluster <- seurat_obj@active.ident
+# Extract log-normalized expression matrix from Seurat object
 expr_matrix <- GetAssayData(seurat_obj, slot = "data")
 
-results <- sctype(exprs = expr_matrix,
-                  cluster_assignments = seurat_obj@meta.data$custom_cluster,
-                  markers = sc_markers,
-                  tissue = tissue_type)
+# Load a neural-focused reference dataset
+# MouseRNAseqData includes neural cell types and can serve as a neural reference
+ref <- celldex::MouseRNAseqData()
 
-celltype_annot <- results$results$cell_types_by_cluster
-print(celltype_annot)
-
-seurat_obj$cell_type <- plyr::mapvalues(
-  seurat_obj$custom_cluster,
-  from = celltype_annot$Cluster,
-  to = celltype_annot$`Cell type`
+# Run SingleR annotation
+singler_results <- SingleR(
+  test = expr_matrix,
+  ref = ref,
+  labels = ref$label.main,     # Main cell type labels in reference
+  assay.type.test = "logcounts",
+  assay.type.ref = "logcounts"
 )
 
-DimPlot(seurat_obj, group.by = "cell_type", label = TRUE, repel = TRUE) + ggtitle("scType Cell Type Annotation")
+# Add SingleR predicted labels to Seurat metadata
+seurat_obj$SingleR_label <- singler_results$pruned.labels
+
+# Visualize UMAP colored by SingleR annotations
+DimPlot(seurat_obj, group.by = "SingleR_label", label = TRUE, repel = TRUE) + 
+  ggtitle("Cell Type Annotation with SingleR")
+
+
+# Add SingleR predicted neural cell type labels to Seurat metadata
+seurat_obj$SingleR_neural_label <- singler_results$pruned.labels
+
+# Plot UMAP with SingleR neural annotations
+DimPlot(seurat_obj, group.by = "SingleR_neural_label", label = TRUE, repel = TRUE) +
+  ggtitle("Neural Cell Type Annotation with SingleR")
 ```
 
-## 💾 Save Seurat Object
+## Save Final Seurat Object
 
 ```{r save}
 saveRDS(seurat_obj, file = "../results/GSM8565269_annotated_seurat.rds")
 ```
+
