@@ -1,7 +1,3 @@
-Here's a cleaned-up and more polished version of your `README.md`, with improved syntax, consistency, and formatting:
-
----
-
 # Single-Nucleus RNA-seq Analysis of Rat Celiac Ganglion (`GSM8565269`)
 
 This repository reanalyses the single-nucleus RNA-seq (snRNA-seq) analysis of the **celiac ganglion dataset** (`GSM8565269`) from [**GSE279253**](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE279253), as presented in the following *Scientific Reports* article:
