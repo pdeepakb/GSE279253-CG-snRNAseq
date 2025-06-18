@@ -1,0 +1,11 @@
+.Rhistory
+.RData
+.Rproj.user/
+\*.rds
+\*.tmp
+**pycache**/
+\*.log
+.DS\_Store
+renv/
+.env/
+\*.conda

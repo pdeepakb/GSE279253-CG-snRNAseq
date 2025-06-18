@@ -1,0 +1,211 @@
+---
+title: "Single-Nucleus RNA-seq Analysis: Celiac Ganglion (GSM8565269)"
+author: "Deepak Balakrishnan\"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Install libraries
+```{r}
+# Ensure remotes package is available
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+
+# Install Seurat v4.3.0 and relevant tools
+remotes::install_version("Seurat", version = "4.3.0", upgrade = "never")
+remotes::install_github("mojaveazure/seurat-disk", force = TRUE)
+remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", force = TRUE)
+
+# Optional devtools (only needed if installing via devtools later)
+if (!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+library(devtools)
+
+# Optionally install SCType (commented unless needed)
+# devtools::install_github("IanevskiAleksandr/sc-type", force = TRUE)
+
+# Bioconductor packages (e.g., for gene annotation and HDF5 support)
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+BiocManager::install("org.Rn.eg.db", ask = FALSE, update = FALSE)
+BiocManager::install("rhdf5", ask = FALSE, update = FALSE)
+
+```
+
+## 📦 Load Required Libraries
+```{r libraries}
+library(Seurat)
+library(SeuratDisk)
+library(ggplot2)
+library(dplyr)
+library(DoubletFinder)
+library(clusterProfiler)
+library(org.Rn.eg.db)
+library(enrichplot)
+#library(scType)
+library(plyr)
+library(rhdf5)
+library(Matrix)
+```
+
+## 📥 Load 10X Data (H5)
+
+```{r load-h5}
+setwd("~/Data/GSE279253-CG-snRNAseq")
+
+file_path <- "~/Data/GSE279253-CG-snRNAseq/data/GSM8565269_CG.h5"
+
+# Read components of the sparse matrix from /matrix group
+data <- h5read(file_path, "/matrix/data")
+indices <- h5read(file_path, "/matrix/indices")
+indptr <- h5read(file_path, "/matrix/indptr")
+barcodes <- h5read(file_path, "/matrix/barcodes")
+features <- h5read(file_path, "/matrix/features/name")
+
+#check for duplicate gene names
+dup_genes <- features[duplicated(features)]
+length(dup_genes)
+
+# Replace underscores with dashes in original features vector
+clean_features <- gsub("_", "-", features)
+
+# Make unique feature names
+unique_features <- make.unique(clean_features)
+
+# Create sparse matrix (CSC format)
+mat <- sparseMatrix(
+  i = indices + 1,
+  p = indptr,
+  x = data,
+  dims = c(length(features), length(barcodes)),
+  dimnames = list(unique_features, barcodes)
+)
+# Transpose matrix because 10X matrices are usually genes x cells,
+# but barcodes are cells and features are genes; depends on the format.
+# Check your data shape to confirm:
+dim(mat)  # Should be cells x genes
+
+# Create Seurat object
+seurat_obj <- CreateSeuratObject(counts = mat, project = "CG", min.cells = 3, min.features = 200)
+
+```
+
+## 🧼 Quality Control Filtering
+
+```{r qc}
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt-")
+VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 1000 & percent.mt < 10)
+```
+
+## 🔎 Doublet Detection and Removal
+
+```{r doublet}
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, npcs = 40)
+
+sweep.res <- paramSweep_v3(seurat_obj, PCs = 1:20, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res)
+bcmvn <- find.pK(sweep.stats)
+
+seurat_obj <- doubletFinder_v3(seurat_obj, PCs = 1:20, pN = 0.25, pK = 0.15, nExp = 100)
+seurat_obj <- subset(seurat_obj, subset = DF.classifications_0.25_0.15_100 == "Singlet")
+```
+
+## 📊 Normalization and Dimensionality Reduction
+
+```{r dimred}
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize")
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, npcs = 40)
+ElbowPlot(seurat_obj)
+```
+
+## 🔗 Clustering and UMAP
+
+```{r cluster}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:40)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:40)
+DimPlot(seurat_obj, reduction = "umap", label = TRUE)
+```
+
+## 🧬 Marker Gene Identification
+
+```{r markers}
+markers <- FindAllMarkers(seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.1, test.use = "wilcox")
+write.csv(markers, "../results/GSM8565269_cluster_markers.csv", row.names = FALSE)
+
+top10 <- markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+DoHeatmap(seurat_obj, features = top10$gene) + NoLegend()
+```
+
+## 🎯 Feature Plots for Known Markers
+
+```{r features}
+FeaturePlot(seurat_obj, features = c("Tacr1", "Cckar", "Ramp1", "Mki67", "Cdk1", "Cdc20"), cols = c("lightgrey", "blue"))
+```
+
+## 🔬 GO Enrichment with `clusterProfiler` (Alternative to GOrilla)
+
+```{r enrich-go}
+cluster1_genes <- markers %>% filter(cluster == 1 & p_val_adj < 0.05) %>% pull(gene)
+
+entrez_genes <- bitr(cluster1_genes,
+                     fromType = "SYMBOL",
+                     toType = "ENTREZID",
+                     OrgDb = org.Rn.eg.db)
+
+ego <- enrichGO(gene = entrez_genes$ENTREZID,
+                OrgDb = org.Rn.eg.db,
+                keyType = "ENTREZID",
+                ont = "BP",
+                pAdjustMethod = "BH",
+                qvalueCutoff = 0.05,
+                readable = TRUE)
+
+dotplot(ego) + ggtitle("GO BP Enrichment - Cluster 1")
+```
+
+## 🧠 Cell Type Annotation with `scType`
+
+```{r sctype}
+sc_markers <- scType_markers
+tissue_type <- "Neural"
+
+seurat_obj@meta.data$custom_cluster <- seurat_obj@active.ident
+expr_matrix <- GetAssayData(seurat_obj, slot = "data")
+
+results <- sctype(exprs = expr_matrix,
+                  cluster_assignments = seurat_obj@meta.data$custom_cluster,
+                  markers = sc_markers,
+                  tissue = tissue_type)
+
+celltype_annot <- results$results$cell_types_by_cluster
+print(celltype_annot)
+
+seurat_obj$cell_type <- plyr::mapvalues(
+  seurat_obj$custom_cluster,
+  from = celltype_annot$Cluster,
+  to = celltype_annot$`Cell type`
+)
+
+DimPlot(seurat_obj, group.by = "cell_type", label = TRUE, repel = TRUE) + ggtitle("scType Cell Type Annotation")
+```
+
+## 💾 Save Seurat Object
+
+```{r save}
+saveRDS(seurat_obj, file = "../results/GSM8565269_annotated_seurat.rds")
+```
