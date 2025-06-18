@@ -1,4 +1,3 @@
-
 ---
 title: "Single-Nucleus RNA-seq Analysis: Celiac Ganglion (GSM8565269)"
 author: "Deepak Balakrishnan\"
@@ -13,17 +12,17 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 ```{r install}
 # Install packages necessary for analysis
-if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
-remotes::install_github("mojaveazure/seurat-disk", force = TRUE)    # For conversion between Seurat and HDF5 formats
-remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", force = TRUE) # Doublet detection tool
+#if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+#remotes::install_github("mojaveazure/seurat-disk", force = TRUE)    # For conversion between Seurat and HDF5 formats
+#remotes::install_github("chris-mcginnis-ucsf/DoubletFinder", force = TRUE) # Doublet detection tool
 
-if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
-library(devtools)
+#if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+#library(devtools)
 
 # Bioconductor packages for gene annotation and HDF5 reading
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-BiocManager::install("org.Rn.eg.db", ask = FALSE, update = FALSE) # Rat genome annotations
-BiocManager::install("rhdf5", ask = FALSE, update = FALSE)       # HDF5 interface
+#if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install("org.Rn.eg.db", ask = FALSE, update = FALSE) # Rat genome annotations
+#BiocManager::install("rhdf5", ask = FALSE, update = FALSE)       # HDF5 interface
 ```
 
 ## Load Required Libraries 
@@ -39,6 +38,7 @@ library(DoubletFinder)    # Doublet detection algorithm for single-cell data
 library(clusterProfiler)  # Functional enrichment analysis (GO, pathways)
 library(org.Rn.eg.db)     # Rat genome annotation database
 library(enrichplot)       # Plot enrichment results
+library(viridis)          # for color-blind friendly palettes
 #library(scType)         # Automated cell type annotation tool (optional)
 library(plyr)             # Data manipulation (for mapvalues function)
 library(rhdf5)            # Read HDF5 files
@@ -107,6 +107,7 @@ keep_cells <- which(is_in_analyzed & (cell_probs >= threshold))
 mat_filtered <- mat[, keep_cells]
 filtered_barcodes <- colnames(mat)[keep_cells]
 colnames(mat_filtered) <- filtered_barcodes
+rownames(mat_filtered) <- gsub("_", "-", rownames(mat_filtered))
 
 # Create Seurat object using filtered matrix (counts)
 seurat_obj <- CreateSeuratObject(counts = mat_filtered)
@@ -118,16 +119,27 @@ seurat_obj <- CreateSeuratObject(counts = mat_filtered)
 **Goal:** Remove low-quality cells/nuclei likely due to debris, dead cells, or doublets.
 
 ```{r QC}
-# Calculate percent mitochondrial genes (genes starting with "mt-")
-seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt-")
+# Basic QC filtering (adjust thresholds as needed)
+# - Keep cells with more than 200 detected features (genes) to remove empty droplets
+# - Keep cells with more thab 500 total UMI counts (no. of RNA molecules detected) to remove low complexity and background RNA
+# - Remove cells with high mitochondrial RNA (>10%), indicating stressed/dead cells
+seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 200 & nCount_RNA > 500 & percent.mt < 10)
 
 # Visualize QC metrics to choose thresholds:
 VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
 
-# Filter cells:
-# - Keep cells with more than 1000 detected features (genes) to remove empty droplets
-# - Remove cells with high mitochondrial RNA (>10%), indicating stressed/dead cells
-seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 1000 & percent.mt < 10)
+# Visualise correlations
+# Store the ggplot object
+p <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+# Add a linear regression line
+p + ggplot2::geom_smooth(method = "lm", color = "red", se = FALSE)
+
+# Histogram visualisations
+hist(seurat_obj$nFeature_RNA, breaks = 100, main = "nFeature_RNA", col = "skyblue")
+hist(seurat_obj$nCount_RNA, breaks = 50, main = "Count", col = "salmon")
+
+
 ```
 
 ## Doublet Detection and Removal
@@ -139,15 +151,38 @@ seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 1000 & percent.mt < 10)
 seurat_obj <- NormalizeData(seurat_obj)
 seurat_obj <- FindVariableFeatures(seurat_obj)
 seurat_obj <- ScaleData(seurat_obj)
+
 seurat_obj <- RunPCA(seurat_obj, npcs = 40)
+# Visualize variance
+ElbowPlot(seurat_obj, ndims = 40)
+
+#Statistical 
+seurat_obj <- JackStraw(seurat_obj, dims = 40, num.replicate = 100)
+seurat_obj <- ScoreJackStraw(seurat_obj, dims = 1:40)
+JackStrawPlot(seurat_obj, dims = 1:40)
 
 # Optimize parameters for doublet detection
-sweep.res <- paramSweep_v3(seurat_obj, PCs = 1:20, sct = FALSE)
-sweep.stats <- summarizeSweep(sweep.res)
-bcmvn <- find.pK(sweep.stats)
+sweep.res <- paramSweep(seurat_obj, PCs = 1:20, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)  # If exists or alternative
+
+# Pick pK with highest BCmetric
+optimal_pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+
+nExp <- as.numeric(round(0.075 * ncol(seurat_obj)))  # conservative assumption 7.5% doublets
 
 # Run DoubletFinder with chosen parameters (pN, pK, expected number of doublets)
-seurat_obj <- doubletFinder_v3(seurat_obj, PCs = 1:20, pN = 0.25, pK = 0.15, nExp = 100)
+seurat_obj <- doubletFinder(seurat_obj, PCs = 1:20, pN = 0.25, pK = optimal_pK, nExp = nExp, sct = FALSE)
+
+
+FeatureScatter(
+  seurat_obj,
+  feature1 = "nCount_RNA",
+  feature2 = "nFeature_RNA",
+  group.by = "DF.classifications_0.25_0.15_100"
+)
+
+FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "DF.classifications_0.25_0.18_182")
 
 # Subset to keep only predicted singlets (non-doublets)
 seurat_obj <- subset(seurat_obj, subset = DF.classifications_0.25_0.15_100 == "Singlet")
@@ -194,18 +229,34 @@ DimPlot(seurat_obj, reduction = "umap", label = TRUE, pt.size = 0.5) + ggtitle("
 markers <- FindAllMarkers(seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.1, test.use = "wilcox")
 
 # Save marker genes table for downstream analysis
-write.csv(markers, "../results/GSM8565269_cluster_markers.csv", row.names = FALSE)
+write.csv(markers, "~/Data/GSE279253-CG-snRNAseq/results/GSM8565269_cluster_markers.csv", row.names = FALSE)
 
 # Visualize top 10 markers per cluster in a heatmap
 top10 <- markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
-DoHeatmap(seurat_obj, features = top10$gene) + NoLegend()
+heatmap <- DoHeatmap(seurat_obj,
+                     features = top10$gene,
+                     group.by = "seurat_clusters",  # cluster/group separation
+                     size = 5,                      # gene label size
+                     angle = 45,                    # rotate x-axis labels
+                     disp.min = -2.5,               # lower cutoff for expression values
+                     disp.max = 2.5) +              # upper cutoff
+  scale_fill_viridis(option = "D", direction = -1) +  # Better contrast
+  NoLegend() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1)
+  )
 
+heatmap
 ```
+
 
 ## Plot Known Marker Genes
 
 ```{r features}
-FeaturePlot(seurat_obj, features = c("Tacr1", "Cckar", "Ramp1", "Mki67", "Cdk1", "Cdc20"), cols = c("lightgrey", "blue")) + ggtitle("Known Marker Expression")
+FeaturePlot(seurat_obj, features = c("Th", "Sox10", "Cd4", "Pdgfra", "Mki67", "Emcn"), cols = c("lightgrey", "blue"))
+
+VlnPlot(seurat_obj, features = c("Th", "Sox10", "Cd4", "Pdgfra", "Mki67", "Emcn"), pt.size = 0)
 
 ```
 
@@ -273,6 +324,6 @@ DimPlot(seurat_obj, group.by = "SingleR_neural_label", label = TRUE, repel = TRU
 ## Save Final Seurat Object
 
 ```{r save}
-saveRDS(seurat_obj, file = "../results/GSM8565269_annotated_seurat.rds")
+saveRDS(seurat_obj, file = "~/Data/GSE279253-CG-snRNAseq/results/GSM8565269_annotated_seurat.rds")
 ```
 

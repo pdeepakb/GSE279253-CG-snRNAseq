@@ -1,5 +1,6 @@
 .Rhistory
 .RData
+\*.RData*
 .Rproj.user/
 \*.rds
 \*.tmp
